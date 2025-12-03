@@ -2,7 +2,7 @@
 """
 Real-Time Crypto Signal Scraper & Dashboard
 Optimized for Render.com PAID Tier
-FIXED: MongoDB operators, HTML escaping, error handling
+FIXED: WebSocket connections, MongoDB operators, HTML escaping
 """
 
 import re
@@ -14,7 +14,7 @@ import os
 import sys
 import signal
 import unicodedata
-import html  # For HTML escaping
+import html
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Set, List
 from dataclasses import dataclass, asdict, field
@@ -152,7 +152,6 @@ class Signal:
             data['timestamp'] = datetime.fromisoformat(data['timestamp'])
         if 'hit_targets' not in data:
             data['hit_targets'] = []
-        # Remove MongoDB _id if present
         data.pop('_id', None)
         return cls(**data)
 
@@ -305,7 +304,7 @@ class SignalParser:
         )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DATABASE MANAGER (FIXED)
+# DATABASE MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DatabaseManager:
@@ -394,27 +393,20 @@ class DatabaseManager:
             return False
     
     async def upsert_signal(self, signal: Signal) -> tuple[bool, bool]:
-        """
-        Insert or update a signal.
-        Returns: (success, is_new)
-        """
+        """Insert or update a signal. Returns: (success, is_new)"""
         if not self._connected:
             return False, False
         
         try:
-            # Check if deleted
             if await self.is_deleted(signal.id):
                 return False, False
             
-            # Check if exists
             existing = await self.signals.find_one({"id": signal.id})
             is_new = existing is None
             
-            # Convert to dict for MongoDB
             signal_data = signal.to_dict()
             
-            # FIXED: Use \$set operator properly
-            result = await self.signals.update_one(
+            await self.signals.update_one(
                 {"id": signal.id},
                 {"\$set": signal_data},
                 upsert=True
@@ -436,7 +428,6 @@ class DatabaseManager:
                 query["status"] = status
             cursor = self.signals.find(query).sort("timestamp", -1).limit(limit)
             results = await cursor.to_list(length=limit)
-            # Convert _id to string for JSON serialization
             for r in results:
                 if '_id' in r:
                     r['_id'] = str(r['_id'])
@@ -588,8 +579,6 @@ class TelegramAlertBot:
         vip = " ⭐ VIP" if signal.is_vip else ""
         
         targets = "\n".join([f"  • TP{i+1}: <code>{t}</code>" for i, t in enumerate(signal.targets)]) or "  • Not specified"
-        
-        # Escape channel name for HTML
         safe_channel = html.escape(signal.channel_name)
         
         return f"""{emoji} <b>NEW SIGNAL</b>{vip}
@@ -658,12 +647,25 @@ class CryptoSignalScraper:
         self._deploy_id = os.getenv("RENDER_GIT_COMMIT", "local")[:8]
     
     # ─────────────────────────────────────────────────────────────────────────
-    # Health Check
+    # Health Check (FIXED - Allows WebSocket Upgrades)
     # ─────────────────────────────────────────────────────────────────────────
     
     async def health_check(self, path: str, request_headers):
-        """HTTP health check handler."""
-        if path in ('/', '/health', '/healthz', '/ping'):
+        """
+        HTTP health check handler.
+        FIXED: Properly detects WebSocket upgrade requests and lets them through.
+        """
+        # Check if this is a WebSocket upgrade request
+        upgrade_header = request_headers.get("Upgrade", "").lower()
+        connection_header = request_headers.get("Connection", "").lower()
+        
+        # If it's a WebSocket upgrade request, let it through
+        if "websocket" in upgrade_header or "upgrade" in connection_header:
+            logger.debug(f"WS: Allowing WebSocket upgrade for path: {path}")
+            return None
+        
+        # For regular HTTP requests to health endpoints
+        if path in ('/', '/health', '/healthz', '/ping', '/ready'):
             uptime = int(time.time() - self._start_time)
             
             health_data = {
@@ -671,11 +673,13 @@ class CryptoSignalScraper:
                 "service": self.config.RENDER_SERVICE_NAME,
                 "deploy_id": self._deploy_id,
                 "uptime_seconds": uptime,
+                "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m",
                 "connections": {
                     "websocket_clients": len(self.broadcaster.clients),
                     "database": "connected" if self.db.is_connected else "disconnected",
                     "telegram": "connected" if (self.telegram_client and self.telegram_client.is_connected()) else "connecting"
                 },
+                "channels_monitored": len(self.channel_cache),
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
@@ -686,11 +690,13 @@ class CryptoSignalScraper:
                 [
                     ("Content-Type", "application/json"),
                     ("Content-Length", str(len(body))),
-                    ("Cache-Control", "no-cache")
+                    ("Cache-Control", "no-cache"),
+                    ("Access-Control-Allow-Origin", "*")
                 ],
                 body
             )
         
+        # For any other path, let it through (might be WebSocket)
         return None
     
     # ─────────────────────────────────────────────────────────────────────────
@@ -702,6 +708,7 @@ class CryptoSignalScraper:
         await self.broadcaster.register(websocket)
         
         try:
+            # Send initial data
             signals = await self.db.get_recent_signals(50)
             await self.broadcaster.send_to_client(websocket, {
                 "type": "initial_data",
@@ -710,6 +717,7 @@ class CryptoSignalScraper:
                 "deploy_id": self._deploy_id
             })
             
+            # Handle messages
             async for message in websocket:
                 try:
                     data = json.loads(message)
@@ -738,6 +746,13 @@ class CryptoSignalScraper:
             await self.broadcaster.send_to_client(websocket, {
                 "type": "stats",
                 "data": stats
+            })
+        elif msg_type == "get_signals":
+            limit = min(data.get("limit", 50), 200)
+            signals = await self.db.get_recent_signals(limit)
+            await self.broadcaster.send_to_client(websocket, {
+                "type": "signals",
+                "data": signals
             })
     
     # ─────────────────────────────────────────────────────────────────────────
@@ -803,7 +818,7 @@ class CryptoSignalScraper:
             logger.error(f"Delete handler error: {e}")
     
     # ─────────────────────────────────────────────────────────────────────────
-    # Admin Commands (FIXED)
+    # Admin Commands
     # ─────────────────────────────────────────────────────────────────────────
     
     async def handle_admin_command(self, event):
@@ -847,7 +862,6 @@ class CryptoSignalScraper:
                     lines = []
                     for cid in all_monitored:
                         name = self.channel_cache.get(cid, f"Unknown ({cid})")
-                        # FIXED: Escape HTML special characters
                         safe_name = html.escape(name)
                         icon = "⭐" if cid in self.config.VIP_CHANNEL_IDS else "📡"
                         lines.append(f"  {icon} {safe_name}")
@@ -1083,7 +1097,10 @@ class CryptoSignalScraper:
                 self.config.WS_PORT,
                 process_request=self.health_check,
                 ping_interval=30,
-                ping_timeout=10
+                ping_timeout=10,
+                close_timeout=5,
+                max_size=2**20,
+                compression=None
             )
             logger.info(f"✅ WebSocket ready on port {self.config.WS_PORT}")
         except Exception as e:
@@ -1102,7 +1119,7 @@ class CryptoSignalScraper:
         self._running = True
         
         logger.info("=" * 60)
-        logger.info("  ✅ Server Ready")
+        logger.info("  ✅ Server Ready - WebSocket accepting connections")
         logger.info("=" * 60)
         
         # Main loop
