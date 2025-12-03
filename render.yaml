@@ -1,0 +1,60 @@
+# Render Infrastructure as Code
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: crypto-signal-scraper
+    runtime: python
+    region: oregon # Choose: oregon, ohio, frankfurt, singapore
+
+    # Build configuration
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python app.py
+
+    # Instance type (paid)
+    plan: starter # Options: starter ($7), standard ($25), pro (\$85)
+
+    # Scaling (optional, for higher tiers)
+    # numInstances: 1
+    # scaling:
+    #   minInstances: 1
+    #   maxInstances: 3
+    #   targetMemoryPercent: 80
+    #   targetCPUPercent: 80
+
+    # Health check
+    healthCheckPath: /health
+
+    # Environment variables (set values in Render Dashboard)
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALERT_CHAT_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: DB_NAME
+        value: crypto_signals
+      - key: CHANNEL_IDS
+        sync: false
+      - key: VIP_CHANNEL_IDS
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BACKFILL_ENABLED
+        value: "true"
+      - key: BACKFILL_LIMIT
+        value: "100"
+      - key: SHUTDOWN_TIMEOUT
+        value: "30"
+
+    # Auto-deploy on push
+    autoDeploy: true
