@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Real-Time Crypto Signal Scraper & Dashboard
-Optimized for Render.com PAID Tier
-FIXED: WebSocket connections, MongoDB operators, HTML escaping
+FIXED: Enhanced signal parser for multiple channel formats
 """
 
 import re
@@ -38,23 +37,19 @@ import aiohttp
 class Config:
     """Application configuration from environment variables."""
     
-    # Telegram API
     API_ID: int = int(os.getenv("API_ID", "0"))
     API_HASH: str = os.getenv("API_HASH", "")
     SESSION_STRING: str = os.getenv("SESSION_STRING", "")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     ALERT_CHAT_ID: int = int(os.getenv("ALERT_CHAT_ID", "0"))
     
-    # MongoDB
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     DB_NAME: str = os.getenv("DB_NAME", "crypto_signals")
     
-    # Server
     WS_HOST: str = "0.0.0.0"
     WS_PORT: int = int(os.getenv("PORT", "10000"))
     SHUTDOWN_TIMEOUT: int = int(os.getenv("SHUTDOWN_TIMEOUT", "30"))
     
-    # Channels
     CHANNEL_IDS: List[int] = [
         int(x.strip()) for x in os.getenv("CHANNEL_IDS", "").split(",") 
         if x.strip().lstrip('-').isdigit()
@@ -70,11 +65,9 @@ class Config:
         if x.strip().lstrip('-').isdigit()
     ]
     
-    # Backfill
     BACKFILL_ENABLED: bool = os.getenv("BACKFILL_ENABLED", "true").lower() == "true"
     BACKFILL_LIMIT: int = int(os.getenv("BACKFILL_LIMIT", "100"))
     
-    # Render
     RENDER_SERVICE_NAME: str = os.getenv("RENDER_SERVICE_NAME", "crypto-signal-scraper")
     RENDER_EXTERNAL_URL: str = os.getenv("RENDER_EXTERNAL_URL", "")
 
@@ -83,7 +76,6 @@ class Config:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def setup_logging() -> logging.Logger:
-    """Configure logging."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s | %(levelname)-8s | %(name)-18s | %(message)s',
@@ -109,7 +101,6 @@ class SignalDirection(Enum):
 
 @dataclass
 class Signal:
-    """Trading signal data structure."""
     id: str
     channel_id: int
     channel_name: str
@@ -127,7 +118,6 @@ class Signal:
     hit_targets: List[int] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to MongoDB-compatible dictionary."""
         return {
             "id": self.id,
             "channel_id": self.channel_id,
@@ -156,145 +146,398 @@ class Signal:
         return cls(**data)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL PARSER
+# ENHANCED SIGNAL PARSER - HANDLES YOUR CHANNEL FORMATS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SignalParser:
-    """Parse trading signals from message text."""
+    """
+    Enhanced signal parser that handles multiple channel formats:
     
-    PAIR_PATTERNS = [
-        r'(?:pair|coin|symbol|ticker)[:\s]*#?([A-Z0-9]+(?:/|\.)?(?:USDT|BUSD|USD|PERP)?)',
-        r'#([A-Z0-9]{2,10}(?:USDT|PERP)?)\b',
-        r'\$([A-Z]{2,10})\b',
-        r'\b([A-Z]{2,10})(?:/|\.)?USDT\b',
-        r'\b([A-Z]{2,10}USDT)\b',
-        r'\b([A-Z]{3,10})\s*(?:LONG|SHORT|Long|Short)\b',
-    ]
+    Format 1: ⚡BEATUSDT⚡ with "Long position" / "Short position"
+    Format 2: BOB/USDT with "Sell / Short Above - 0.0200"
+    Format 3: ONDO/𝑼𝑺𝑫𝑻 with fancy Unicode fonts
+    """
     
-    DIRECTION_PATTERNS = [
-        (r'\b(LONG|Long|long|BUY|Buy|buy|BULLISH|Bullish|🟢|🔼|⬆️|📈)\b', SignalDirection.LONG),
-        (r'\b(SHORT|Short|short|SELL|Sell|sell|BEARISH|Bearish|🔴|🔽|⬇️|📉)\b', SignalDirection.SHORT),
-    ]
-    
-    ENTRY_PATTERNS = [
-        r'(?:entry|enter|buy|sell|price|ep)[:\s]*(?:zone)?[:\s]*[\$]?([\d.,\s\-–to]+)',
-        r'(?:entry|enter|ep)[:\s]*(?:market|now|cmp|current)',
-        r'(?:cmp|current\s*price)[:\s]*[\$]?([\d.,]+)',
-    ]
-    
-    TARGET_PATTERNS = [
-        r'(?:tp|target|take[\s]?profit)\s*\d*[:\s]*[\$]?([\d.,]+)',
-        r'🎯\s*[\$]?([\d.,]+)',
-    ]
-    
-    STOPLOSS_PATTERNS = [
-        r'(?:sl|stop[\s]?loss|stoploss|stop)[:\s]*[\$]?([\d.,]+)',
-        r'🛑\s*[\$]?([\d.,]+)',
-    ]
-    
-    LEVERAGE_PATTERNS = [
-        r'(?:leverage|lev)[:\s]*(?:cross|isolated)?[:\s]*(\d+)[xX×]?',
-        r'(\d+)[xX×]\s*(?:leverage|lev)?',
-    ]
+    # Common crypto pairs that might appear without USDT suffix
+    KNOWN_COINS = {
+        'BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'SHIB',
+        'LTC', 'TRX', 'AVAX', 'LINK', 'ATOM', 'UNI', 'XMR', 'ETC', 'XLM', 'BCH',
+        'APT', 'FIL', 'LDO', 'ARB', 'OP', 'INJ', 'SUI', 'SEI', 'TIA', 'JUP',
+        'PEPE', 'WIF', 'BONK', 'FLOKI', 'MEME', 'ORDI', 'SATS', 'RATS', '1000SATS',
+        'ONDO', 'BOB', 'BEAT', 'RENDER', 'FET', 'AGIX', 'OCEAN', 'TAO', 'WLD',
+        'NEAR', 'ICP', 'VET', 'ALGO', 'GRT', 'FTM', 'SAND', 'MANA', 'AXS', 'GALA',
+        'ENJ', 'IMX', 'BLUR', 'MAGIC', 'GMT', 'APE', 'DYDX', 'GMX', 'SNX', 'CRV',
+        'AAVE', 'MKR', 'COMP', 'SUSHI', 'YFI', 'BAL', 'ZRX', '1INCH', 'LQTY',
+        'PENDLE', 'EIGEN', 'ENA', 'ETHFI', 'W', 'STRK', 'PYTH', 'JTO', 'NTRN',
+        'DYM', 'ALT', 'MANTA', 'PIXEL', 'PORTAL', 'AEVO', 'BOME', 'SLERF'
+    }
 
     @staticmethod
     def normalize_text(text: str) -> str:
-        return unicodedata.normalize('NFKC', text)
+        """
+        Normalize Unicode text - converts fancy fonts to regular ASCII.
+        Examples: 𝑳𝒐𝒏𝒈 -> Long, 𝑼𝑺𝑫𝑻 -> USDT
+        """
+        # NFKC normalization converts mathematical/fancy Unicode to ASCII
+        normalized = unicodedata.normalize('NFKC', text)
+        return normalized
+    
+    @staticmethod
+    def remove_emojis(text: str) -> str:
+        """Remove emojis from text for cleaner parsing."""
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # emoticons
+            "\U0001F300-\U0001F5FF"  # symbols & pictographs
+            "\U0001F680-\U0001F6FF"  # transport & map symbols
+            "\U0001F1E0-\U0001F1FF"  # flags
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "\U0001f926-\U0001f937"
+            "\U00010000-\U0010ffff"
+            "\u2640-\u2642"
+            "\u2600-\u2B55"
+            "\u200d"
+            "\u23cf"
+            "\u23e9"
+            "\u231a"
+            "\ufe0f"
+            "\u3030"
+            "\u2066"
+            "\u2069"
+            "⚡🔴🟢🎯🛑⛔️💰📈📉🥀🌹⬆️⬇️🔼🔽"
+            "]+", 
+            flags=re.UNICODE
+        )
+        return emoji_pattern.sub(' ', text)
     
     @staticmethod
     def clean_number(value: str) -> str:
+        """Clean and extract number from string."""
         if not value:
             return ""
-        value = re.sub(r'\s+', '', value)
-        value = value.replace(',', '').replace('to', '-').replace('–', '-')
-        return value.strip('-')
+        # Remove everything except digits, dots, and minus
+        value = re.sub(r'[^\d.,\-]', '', value)
+        value = value.replace(',', '').strip('.-')
+        return value
+
+    @classmethod
+    def extract_pair(cls, text: str, normalized: str) -> Optional[str]:
+        """
+        Extract trading pair from text.
+        Handles: ⚡BEATUSDT⚡, BOB/USDT, ONDO/USDT(emojis), #BTCUSDT, \$BTC
+        """
+        text_upper = normalized.upper()
+        
+        # Pattern 1: Emoji-wrapped pairs like ⚡BEATUSDT⚡
+        emoji_wrapped = re.search(r'[⚡💎🔥✨]+\s*([A-Z0-9]{2,15}(?:USDT|BUSD|USD)?)\s*[⚡💎🔥✨]+', text_upper)
+        if emoji_wrapped:
+            pair = emoji_wrapped.group(1)
+            if not pair.endswith(('USDT', 'BUSD', 'USD')):
+                pair += 'USDT'
+            return pair.replace('BUSD', 'USDT').replace('USD', 'USDT').rstrip('T') + 'T' if not pair.endswith('USDT') else pair
+        
+        # Pattern 2: Pair at start of line with /USDT format: BOB/USDT, ONDO/USDT
+        line_start = re.search(r'^([A-Z0-9]{2,10})\s*/\s*USDT', text_upper, re.MULTILINE)
+        if line_start:
+            return line_start.group(1) + 'USDT'
+        
+        # Pattern 3: Hashtag pairs: #BTCUSDT, #BTC
+        hashtag = re.search(r'#([A-Z0-9]{2,15}(?:USDT|PERP)?)\b', text_upper)
+        if hashtag:
+            pair = hashtag.group(1).replace('PERP', '')
+            if not pair.endswith('USDT'):
+                pair += 'USDT'
+            return pair
+        
+        # Pattern 4: Dollar sign pairs: \$BTC, \$ETH
+        dollar = re.search(r'\$([A-Z]{2,10})\b', text_upper)
+        if dollar:
+            return dollar.group(1) + 'USDT'
+        
+        # Pattern 5: Standard XXXUSDT format anywhere in text
+        standard = re.search(r'\b([A-Z0-9]{2,10}USDT)\b', text_upper)
+        if standard:
+            return standard.group(1)
+        
+        # Pattern 6: Known coin names followed by direction keywords
+        for coin in cls.KNOWN_COINS:
+            pattern = rf'\b{coin}\b.*(?:LONG|SHORT|BUY|SELL)'
+            if re.search(pattern, text_upper, re.IGNORECASE):
+                return coin + 'USDT'
+        
+        # Pattern 7: Any potential pair format XXX/USDT or XXX/USD
+        slash_pair = re.search(r'\b([A-Z0-9]{2,10})\s*/\s*(?:USDT|USD|BUSD)', text_upper)
+        if slash_pair:
+            return slash_pair.group(1) + 'USDT'
+        
+        # Pattern 8: Pair with emoji suffix like ONDO/USDT(🥀🌹🥀)
+        emoji_suffix = re.search(r'([A-Z0-9]{2,10})\s*/\s*USDT\s*\(', text_upper)
+        if emoji_suffix:
+            return emoji_suffix.group(1) + 'USDT'
+        
+        return None
+    
+    @classmethod
+    def extract_direction(cls, normalized: str) -> SignalDirection:
+        """
+        Extract trade direction.
+        Handles: "Long position", "Short position", "Sell / Short", "Buy Long"
+        """
+        text_upper = normalized.upper()
+        
+        # Long patterns
+        long_patterns = [
+            r'\bLONG\s*POSITION\b',
+            r'\bLONG\b',
+            r'\bBUY\s*/?\s*LONG\b',
+            r'\bBUY\s+LONG\b',
+            r'\bBUY\b(?!\s*ZONE)',  # BUY but not "BUY ZONE"
+            r'\bBULLISH\b',
+            r'🟢',
+            r'📈',
+            r'⬆️',
+            r'🔼',
+        ]
+        
+        # Short patterns
+        short_patterns = [
+            r'\bSHORT\s*POSITION\b',
+            r'\bSHORT\b',
+            r'\bSELL\s*/?\s*SHORT\b',
+            r'\bSELL\s+SHORT\b',
+            r'\bSELL\b(?!\s*ZONE)',  # SELL but not "SELL ZONE"
+            r'\bBEARISH\b',
+            r'🔴',
+            r'📉',
+            r'⬇️',
+            r'🔽',
+        ]
+        
+        # Check for Long
+        for pattern in long_patterns:
+            if re.search(pattern, text_upper) or re.search(pattern, normalized):
+                # Make sure it's not negated by "Short" appearing more prominently
+                long_pos = re.search(pattern, text_upper)
+                short_match = re.search(r'\bSHORT\b', text_upper)
+                if long_pos:
+                    if not short_match or long_pos.start() < short_match.start():
+                        return SignalDirection.LONG
+        
+        # Check for Short
+        for pattern in short_patterns:
+            if re.search(pattern, text_upper) or re.search(pattern, normalized):
+                return SignalDirection.SHORT
+        
+        return SignalDirection.UNKNOWN
+    
+    @classmethod
+    def extract_entry(cls, normalized: str) -> str:
+        """
+        Extract entry price.
+        Handles: "Entry market price", "Above - 0.0200", "Above-0.4603", "Entry: 50000"
+        """
+        text_upper = normalized.upper()
+        
+        # Check for market entry
+        market_patterns = [
+            r'ENTRY\s*(?::|-)?\s*MARKET',
+            r'MARKET\s*PRICE',
+            r'ENTRY\s*(?:AT\s*)?MARKET',
+            r'CMP',
+            r'CURRENT\s*(?:MARKET\s*)?PRICE',
+            r'MARKET\s*ENTRY',
+        ]
+        
+        for pattern in market_patterns:
+            if re.search(pattern, text_upper):
+                return "Market"
+        
+        # Entry with "Above" or "Below" - common format
+        above_below = re.search(
+            r'(?:ABOVE|BELOW|AROUND|NEAR|AT)\s*[-:=]?\s*([\d.,]+)', 
+            text_upper
+        )
+        if above_below:
+            return cls.clean_number(above_below.group(1))
+        
+        # Standard entry patterns
+        entry_patterns = [
+            r'ENTRY\s*(?:PRICE|ZONE|POINT)?[\s:=-]*([\d.,]+(?:\s*[-–]\s*[\d.,]+)?)',
+            r'ENTER\s*(?:AT|AROUND|NEAR)?[\s:=-]*([\d.,]+)',
+            r'BUY\s*(?:AT|AROUND|NEAR|ZONE)?[\s:=-]*([\d.,]+)',
+            r'SELL\s*(?:AT|AROUND|NEAR|ZONE)?[\s:=-]*([\d.,]+)',
+            r'EP[\s:=-]*([\d.,]+)',
+            r'PRICE[\s:=-]*([\d.,]+)',
+        ]
+        
+        for pattern in entry_patterns:
+            match = re.search(pattern, text_upper)
+            if match:
+                entry = cls.clean_number(match.group(1))
+                if entry and float(entry) > 0:
+                    return entry
+        
+        return "Market"
+    
+    @classmethod
+    def extract_targets(cls, normalized: str) -> List[str]:
+        """
+        Extract take profit targets.
+        Handles: "TP-0.002", "TAKE PROFIT: 300%", "Targets 35%/45%/55%", "TP1: 100, TP2: 200"
+        """
+        targets = []
+        seen = set()
+        text_upper = normalized.upper()
+        
+        # Pattern 1: Multiple percentage targets like "35%/45%/55%"
+        pct_targets = re.search(r'TARGETS?\s*[\n:]?\s*([\d.]+%(?:\s*/\s*[\d.]+%)+)', text_upper)
+        if pct_targets:
+            percentages = re.findall(r'([\d.]+)%', pct_targets.group(1))
+            for pct in percentages:
+                if pct not in seen:
+                    targets.append(f"{pct}%")
+                    seen.add(pct)
+        
+        # Pattern 2: Single percentage target like "TAKE PROFIT: 300%"
+        single_pct = re.search(r'(?:TAKE\s*PROFIT|TP)\s*[:\-=]?\s*([\d.]+)\s*%', text_upper)
+        if single_pct and single_pct.group(1) not in seen:
+            targets.append(f"{single_pct.group(1)}%")
+            seen.add(single_pct.group(1))
+        
+        # Pattern 3: TP with price (no space): TP-0.002, TP:100
+        tp_no_space = re.findall(r'TP\s*[-:=]?\s*([\d.,]+)(?!\s*%)', text_upper)
+        for tp in tp_no_space:
+            cleaned = cls.clean_number(tp)
+            if cleaned and cleaned not in seen:
+                targets.append(cleaned)
+                seen.add(cleaned)
+        
+        # Pattern 4: Numbered targets: TP1: 100, TP2: 200
+        numbered_tp = re.findall(r'TP\s*\d*\s*[:\-=]\s*([\d.,]+)', text_upper)
+        for tp in numbered_tp:
+            cleaned = cls.clean_number(tp)
+            if cleaned and cleaned not in seen:
+                targets.append(cleaned)
+                seen.add(cleaned)
+        
+        # Pattern 5: TARGET/TAKE PROFIT with price
+        target_patterns = [
+            r'TARGET\s*\d*\s*[:\-=]\s*([\d.,]+)',
+            r'TAKE\s*PROFIT\s*\d*\s*[:\-=]\s*([\d.,]+)',
+            r'🎯\s*([\d.,]+)',
+        ]
+        
+        for pattern in target_patterns:
+            matches = re.findall(pattern, text_upper)
+            for match in matches:
+                cleaned = cls.clean_number(match)
+                if cleaned and cleaned not in seen:
+                    targets.append(cleaned)
+                    seen.add(cleaned)
+        
+        return targets[:6]  # Max 6 targets
+    
+    @classmethod
+    def extract_stop_loss(cls, normalized: str) -> str:
+        """
+        Extract stop loss price.
+        Handles: "SL- 0.022", "STOP LOSS: 0.4350", "SL:100"
+        """
+        text_upper = normalized.upper()
+        
+        patterns = [
+            r'(?:STOP\s*LOSS|STOPLOSS|SL)\s*[:\-=]\s*([\d.,]+)',
+            r'SL\s*[:\-=]?\s*([\d.,]+)',
+            r'STOP\s*[:\-=]\s*([\d.,]+)',
+            r'🛑\s*([\d.,]+)',
+            r'⛔\s*([\d.,]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_upper)
+            if match:
+                return cls.clean_number(match.group(1))
+        
+        return ""
+    
+    @classmethod
+    def extract_leverage(cls, normalized: str) -> str:
+        """
+        Extract leverage.
+        Handles: "LEVERAGE - 10X (cross)", "10X", "10x Cross"
+        """
+        text_upper = normalized.upper()
+        
+        patterns = [
+            r'LEVERAGE\s*[-:=]?\s*(\d+)\s*X',
+            r'LEV\s*[-:=]?\s*(\d+)\s*X',
+            r'(\d+)\s*X\s*(?:CROSS|ISOLATED|LEVERAGE)?',
+            r'(\d+)X',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text_upper)
+            if match:
+                lev = match.group(1)
+                if lev.isdigit() and 1 <= int(lev) <= 125:
+                    return f"{lev}x"
+        
+        return ""
 
     @classmethod
     def parse(cls, text: str, channel_id: int, channel_name: str, 
               message_id: int, is_vip: bool = False) -> Optional[Signal]:
-        """Parse message text into a Signal object."""
-        
-        normalized = cls.normalize_text(text)
-        text_upper = normalized.upper()
-        
-        # Extract pair
-        pair = None
-        for pattern in cls.PAIR_PATTERNS:
-            match = re.search(pattern, text_upper, re.IGNORECASE | re.MULTILINE)
-            if match:
-                pair = match.group(1).replace('/', '').replace('.', '').upper()
-                pair = pair.replace('PERP', '').replace('BUSD', 'USDT')
-                if not pair.endswith('USDT'):
-                    pair += 'USDT'
-                break
-        
-        if not pair and not is_vip:
+        """
+        Parse message text into a Signal object.
+        """
+        if not text or len(text) < 10:
             return None
         
-        # Extract direction
-        direction = SignalDirection.UNKNOWN
-        for pattern, dir_type in cls.DIRECTION_PATTERNS:
-            if re.search(pattern, normalized):
-                direction = dir_type
-                break
+        # Step 1: Normalize Unicode (converts fancy fonts to ASCII)
+        normalized = cls.normalize_text(text)
         
-        # Extract entry
-        entry = "Market"
-        for pattern in cls.ENTRY_PATTERNS:
-            match = re.search(pattern, normalized, re.IGNORECASE)
-            if match:
-                matched_text = match.group(0).lower()
-                if any(kw in matched_text for kw in ['market', 'now', 'cmp', 'current']):
-                    entry = "Market"
-                elif match.lastindex and match.group(1):
-                    entry = cls.clean_number(match.group(1))
-                break
+        # Step 2: Log for debugging (first 100 chars)
+        logger.debug(f"Parsing message from {channel_name}: {normalized[:100]}...")
         
-        # Extract targets
-        targets = []
-        seen = set()
-        for pattern in cls.TARGET_PATTERNS:
-            for match in re.finditer(pattern, normalized, re.IGNORECASE):
-                if match.lastindex:
-                    cleaned = cls.clean_number(match.group(1))
-                    if cleaned and cleaned not in seen:
-                        targets.append(cleaned)
-                        seen.add(cleaned)
+        # Step 3: Extract pair
+        pair = cls.extract_pair(text, normalized)
+        if not pair:
+            logger.debug(f"No pair found in message from {channel_name}")
+            if not is_vip:
+                return None
+            pair = "UNKNOWN"
         
-        # Extract stop loss
-        stop_loss = ""
-        for pattern in cls.STOPLOSS_PATTERNS:
-            match = re.search(pattern, normalized, re.IGNORECASE)
-            if match and match.lastindex:
-                stop_loss = cls.clean_number(match.group(1))
-                break
+        # Step 4: Extract direction
+        direction = cls.extract_direction(normalized)
+        if direction == SignalDirection.UNKNOWN and not is_vip:
+            logger.debug(f"No direction found in message from {channel_name}")
+            return None
         
-        # Extract leverage
-        leverage = ""
-        for pattern in cls.LEVERAGE_PATTERNS:
-            match = re.search(pattern, normalized, re.IGNORECASE)
-            if match and match.lastindex:
-                lev_value = match.group(1)
-                if lev_value.isdigit() and 1 <= int(lev_value) <= 125:
-                    leverage = f"{lev_value}x"
-                break
+        # Step 5: Extract other fields
+        entry = cls.extract_entry(normalized)
+        targets = cls.extract_targets(normalized)
+        stop_loss = cls.extract_stop_loss(normalized)
+        leverage = cls.extract_leverage(normalized)
         
-        # Validation
+        # Step 6: Validation
+        # For VIP channels, we're more lenient
         if not is_vip:
-            if not pair or direction == SignalDirection.UNKNOWN:
-                return None
+            # Must have either specific entry or targets
             if entry == "Market" and not targets:
+                logger.debug(f"No entry or targets found in message from {channel_name}")
                 return None
         
-        return Signal(
+        # Step 7: Create signal
+        signal = Signal(
             id=f"{channel_id}:{message_id}",
             channel_id=channel_id,
             channel_name=channel_name,
             message_id=message_id,
-            pair=pair or "UNKNOWN",
+            pair=pair,
             direction=direction.value,
             entry=entry,
-            targets=targets[:6],
+            targets=targets,
             stop_loss=stop_loss,
             leverage=leverage,
             raw_text=text[:2000],
@@ -302,14 +545,16 @@ class SignalParser:
             is_vip=is_vip,
             status="ACTIVE"
         )
+        
+        logger.info(f"✅ Parsed: {pair} {direction.value} | Entry: {entry} | Targets: {len(targets)} | SL: {stop_loss or 'N/A'}")
+        
+        return signal
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DatabaseManager:
-    """Async MongoDB manager."""
-    
     def __init__(self, uri: str, db_name: str):
         self.uri = uri
         self.db_name = db_name
@@ -321,7 +566,6 @@ class DatabaseManager:
         self._lock = asyncio.Lock()
     
     async def connect(self) -> bool:
-        """Connect to MongoDB."""
         async with self._lock:
             if self._connected:
                 return True
@@ -344,7 +588,6 @@ class DatabaseManager:
                     self.signals = self.db['signals']
                     self.deleted = self.db['deleted_signals']
                     
-                    # Create indexes
                     await self.signals.create_index("id", unique=True)
                     await self.signals.create_index([("timestamp", -1)])
                     await self.signals.create_index("pair")
@@ -367,7 +610,6 @@ class DatabaseManager:
         return self._connected
     
     async def is_deleted(self, signal_id: str) -> bool:
-        """Check if signal was previously deleted."""
         if not self._connected:
             return False
         try:
@@ -377,7 +619,6 @@ class DatabaseManager:
             return False
     
     async def mark_deleted(self, signal_id: str) -> bool:
-        """Mark a signal as deleted."""
         if not self._connected:
             return False
         try:
@@ -393,7 +634,6 @@ class DatabaseManager:
             return False
     
     async def upsert_signal(self, signal: Signal) -> tuple[bool, bool]:
-        """Insert or update a signal. Returns: (success, is_new)"""
         if not self._connected:
             return False, False
         
@@ -419,7 +659,6 @@ class DatabaseManager:
             return False, False
     
     async def get_recent_signals(self, limit: int = 50, status: str = None) -> List[Dict]:
-        """Get recent signals."""
         if not self._connected:
             return []
         try:
@@ -437,7 +676,6 @@ class DatabaseManager:
             return []
     
     async def get_stats(self) -> Dict[str, Any]:
-        """Get signal statistics."""
         if not self._connected:
             return {"total": 0, "active": 0, "hit_tp": 0, "hit_sl": 0, "win_rate": 0}
         try:
@@ -461,7 +699,6 @@ class DatabaseManager:
             return {"total": 0, "active": 0, "hit_tp": 0, "hit_sl": 0, "win_rate": 0}
     
     async def reset_signals(self) -> int:
-        """Delete all signals."""
         if not self._connected:
             return 0
         try:
@@ -472,7 +709,6 @@ class DatabaseManager:
             return 0
     
     async def close(self):
-        """Close database connection."""
         if self.client:
             self.client.close()
             self._connected = False
@@ -482,8 +718,6 @@ class DatabaseManager:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WebSocketBroadcaster:
-    """WebSocket connection manager."""
-    
     def __init__(self):
         self.clients: Set[websockets.WebSocketServerProtocol] = set()
         self.server = None
@@ -555,14 +789,17 @@ class WebSocketBroadcaster:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TelegramAlertBot:
-    """Send alerts via Telegram Bot API."""
-    
     def __init__(self, bot_token: str, chat_id: int):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.api_url = f"https://api.telegram.org/bot{bot_token}"
         self._session: Optional[aiohttp.ClientSession] = None
         self._enabled = bool(bot_token and chat_id)
+        
+        if self._enabled:
+            logger.info(f"✅ Alert Bot enabled, sending to chat: {chat_id}")
+        else:
+            logger.warning("⚠️ Alert Bot disabled (missing BOT_TOKEN or ALERT_CHAT_ID)")
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -578,7 +815,12 @@ class TelegramAlertBot:
         emoji = "🟢" if signal.direction == "LONG" else "🔴" if signal.direction == "SHORT" else "⚪"
         vip = " ⭐ VIP" if signal.is_vip else ""
         
-        targets = "\n".join([f"  • TP{i+1}: <code>{t}</code>" for i, t in enumerate(signal.targets)]) or "  • Not specified"
+        # Format targets
+        if signal.targets:
+            targets = "\n".join([f"  • TP{i+1}: <code>{t}</code>" for i, t in enumerate(signal.targets)])
+        else:
+            targets = "  • Market targets"
+        
         safe_channel = html.escape(signal.channel_name)
         
         return f"""{emoji} <b>NEW SIGNAL</b>{vip}
@@ -596,34 +838,38 @@ class TelegramAlertBot:
 📡 <i>{safe_channel}</i>
 🕐 <i>{signal.timestamp.strftime("%Y-%m-%d %H:%M UTC")}</i>
 
-<a href="https://www.tradingview.com/chart/?symbol=BINANCE:{signal.pair}.P">📊 Chart</a>"""
+<a href="https://www.tradingview.com/chart/?symbol=BINANCE:{signal.pair}.P">📊 TradingView</a> | <a href="https://www.binance.com/en/futures/{signal.pair}">📈 Binance</a>"""
     
     async def send_alert(self, signal: Signal) -> bool:
         if not self._enabled:
+            logger.warning("Alert Bot not enabled, skipping alert")
             return False
         
         try:
             session = await self._get_session()
+            message = self.format_signal(signal)
+            
+            logger.info(f"📨 Sending alert for {signal.pair} {signal.direction}...")
             
             async with session.post(
                 f"{self.api_url}/sendMessage",
                 json={
                     "chat_id": self.chat_id,
-                    "text": self.format_signal(signal),
+                    "text": message,
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True
                 }
             ) as resp:
                 if resp.status == 200:
-                    logger.info(f"📨 Alert sent: {signal.pair} {signal.direction}")
+                    logger.info(f"✅ Alert sent: {signal.pair} {signal.direction}")
                     return True
                 else:
                     error = await resp.text()
-                    logger.error(f"Alert failed [{resp.status}]: {error[:100]}")
+                    logger.error(f"❌ Alert failed [{resp.status}]: {error[:200]}")
                     return False
                     
         except Exception as e:
-            logger.error(f"Alert error: {e}")
+            logger.error(f"❌ Alert error: {e}")
             return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -631,8 +877,6 @@ class TelegramAlertBot:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CryptoSignalScraper:
-    """Main application."""
-    
     def __init__(self):
         self.config = Config()
         self.db = DatabaseManager(self.config.MONGO_URI, self.config.DB_NAME)
@@ -645,26 +889,16 @@ class CryptoSignalScraper:
         self._start_time = time.time()
         self._shutdown_event = asyncio.Event()
         self._deploy_id = os.getenv("RENDER_GIT_COMMIT", "local")[:8]
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # Health Check (FIXED - Allows WebSocket Upgrades)
-    # ─────────────────────────────────────────────────────────────────────────
+        self._signals_processed = 0
+        self._signals_parsed = 0
     
     async def health_check(self, path: str, request_headers):
-        """
-        HTTP health check handler.
-        FIXED: Properly detects WebSocket upgrade requests and lets them through.
-        """
-        # Check if this is a WebSocket upgrade request
         upgrade_header = request_headers.get("Upgrade", "").lower()
         connection_header = request_headers.get("Connection", "").lower()
         
-        # If it's a WebSocket upgrade request, let it through
         if "websocket" in upgrade_header or "upgrade" in connection_header:
-            logger.debug(f"WS: Allowing WebSocket upgrade for path: {path}")
             return None
         
-        # For regular HTTP requests to health endpoints
         if path in ('/', '/health', '/healthz', '/ping', '/ready'):
             uptime = int(time.time() - self._start_time)
             
@@ -674,12 +908,16 @@ class CryptoSignalScraper:
                 "deploy_id": self._deploy_id,
                 "uptime_seconds": uptime,
                 "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m",
+                "stats": {
+                    "messages_processed": self._signals_processed,
+                    "signals_parsed": self._signals_parsed,
+                },
                 "connections": {
                     "websocket_clients": len(self.broadcaster.clients),
                     "database": "connected" if self.db.is_connected else "disconnected",
                     "telegram": "connected" if (self.telegram_client and self.telegram_client.is_connected()) else "connecting"
                 },
-                "channels_monitored": len(self.channel_cache),
+                "channels_monitored": len(self.config.CHANNEL_IDS) + len(self.config.VIP_CHANNEL_IDS),
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             
@@ -696,19 +934,12 @@ class CryptoSignalScraper:
                 body
             )
         
-        # For any other path, let it through (might be WebSocket)
         return None
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # WebSocket Handler
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def websocket_handler(self, websocket):
-        """Handle WebSocket connections."""
         await self.broadcaster.register(websocket)
         
         try:
-            # Send initial data
             signals = await self.db.get_recent_signals(50)
             await self.broadcaster.send_to_client(websocket, {
                 "type": "initial_data",
@@ -717,7 +948,6 @@ class CryptoSignalScraper:
                 "deploy_id": self._deploy_id
             })
             
-            # Handle messages
             async for message in websocket:
                 try:
                     data = json.loads(message)
@@ -733,7 +963,6 @@ class CryptoSignalScraper:
             await self.broadcaster.unregister(websocket)
     
     async def _handle_ws_message(self, websocket, data: Dict):
-        """Process WebSocket messages."""
         msg_type = data.get("type", "")
         
         if msg_type == "ping":
@@ -755,12 +984,8 @@ class CryptoSignalScraper:
                 "data": signals
             })
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Telegram Event Handlers
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def on_new_message(self, event):
-        """Handle new messages."""
+        """Handle new messages from monitored channels."""
         try:
             chat_id = event.chat_id
             
@@ -772,9 +997,16 @@ class CryptoSignalScraper:
             if not message or not message.text:
                 return
             
+            self._signals_processed += 1
+            
             channel_name = self.channel_cache.get(chat_id, f"Channel {chat_id}")
             is_vip = chat_id in self.config.VIP_CHANNEL_IDS
             
+            # Log incoming message for debugging
+            logger.info(f"📩 New message from {channel_name} (VIP: {is_vip})")
+            logger.debug(f"Message text: {message.text[:200]}...")
+            
+            # Parse signal
             signal = SignalParser.parse(
                 text=message.text,
                 channel_id=chat_id,
@@ -784,29 +1016,36 @@ class CryptoSignalScraper:
             )
             
             if not signal:
+                logger.info(f"⏭️ Message not parsed as signal from {channel_name}")
                 return
             
+            self._signals_parsed += 1
+            
+            # Save to database
             success, is_new = await self.db.upsert_signal(signal)
             
             if success:
                 log_prefix = "🆕 NEW" if is_new else "🔄 UPD"
-                logger.info(f"{log_prefix} | {signal.pair:12} | {signal.direction:5} | {channel_name[:30]}")
+                logger.info(f"{log_prefix} | {signal.pair:12} | {signal.direction:5} | Entry: {signal.entry} | {channel_name[:25]}")
                 
+                # Broadcast to WebSocket clients
                 event_type = "new_signal" if is_new else "update_signal"
                 await self.broadcaster.broadcast_signal(signal, event_type)
+                logger.info(f"📡 Broadcasted to {len(self.broadcaster.clients)} WS clients")
                 
+                # Send Telegram alert for NEW signals only
                 if is_new:
-                    asyncio.create_task(self.alert_bot.send_alert(signal))
+                    alert_sent = await self.alert_bot.send_alert(signal)
+                    if not alert_sent:
+                        logger.warning(f"⚠️ Failed to send Telegram alert for {signal.pair}")
                     
         except Exception as e:
-            logger.error(f"Message handler error: {e}")
+            logger.error(f"❌ Message handler error: {e}", exc_info=True)
     
     async def on_message_edited(self, event):
-        """Handle edited messages."""
         await self.on_new_message(event)
     
     async def on_message_deleted(self, event):
-        """Handle deleted messages."""
         try:
             chat_id = event.chat_id
             for msg_id in event.deleted_ids:
@@ -817,12 +1056,7 @@ class CryptoSignalScraper:
         except Exception as e:
             logger.error(f"Delete handler error: {e}")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Admin Commands
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def handle_admin_command(self, event):
-        """Handle admin commands."""
         sender_id = event.sender_id
         
         if sender_id not in self.config.ADMIN_IDS:
@@ -842,11 +1076,16 @@ class CryptoSignalScraper:
   • Uptime: {h}h {m}m {s}s
   • Deploy: <code>{self._deploy_id}</code>
   • WS Clients: {len(self.broadcaster.clients)}
-  • Channels: {len(self.channel_cache)}
+
+<b>Processing:</b>
+  • Messages Processed: {self._signals_processed}
+  • Signals Parsed: {self._signals_parsed}
+  • Parse Rate: {(self._signals_parsed/self._signals_processed*100) if self._signals_processed > 0 else 0:.1f}%
 
 <b>Connections:</b>
   • Database: {'✅' if self.db.is_connected else '❌'}
   • Telegram: {'✅' if self.telegram_client and self.telegram_client.is_connected() else '❌'}
+  • Alert Bot: {'✅' if self.alert_bot._enabled else '❌'}
 
 <b>Signals:</b>
   • Total: {stats.get('total', 0)}
@@ -876,7 +1115,31 @@ class CryptoSignalScraper:
             
             elif text == "/reset":
                 count = await self.db.reset_signals()
-                await event.respond(f"🗑️ Deleted {count} signals.")
+                self._signals_processed = 0
+                self._signals_parsed = 0
+                await event.respond(f"🗑️ Deleted {count} signals and reset counters.")
+            
+            elif text == "/test":
+                # Send a test alert
+                test_signal = Signal(
+                    id="test:0",
+                    channel_id=0,
+                    channel_name="Test Channel",
+                    message_id=0,
+                    pair="BTCUSDT",
+                    direction="LONG",
+                    entry="50000",
+                    targets=["51000", "52000", "53000"],
+                    stop_loss="49000",
+                    leverage="10x",
+                    raw_text="Test signal",
+                    timestamp=datetime.now(timezone.utc),
+                    is_vip=False,
+                    status="ACTIVE"
+                )
+                alert_sent = await self.alert_bot.send_alert(test_signal)
+                await self.broadcaster.broadcast_signal(test_signal, "new_signal")
+                await event.respond(f"✅ Test signal sent!\n• Alert Bot: {'✅' if alert_sent else '❌'}\n• WS Clients: {len(self.broadcaster.clients)}")
             
             elif text.startswith("/broadcast "):
                 msg = text[11:].strip()
@@ -894,6 +1157,7 @@ class CryptoSignalScraper:
                     "/status - System status\n"
                     "/channels - List channels\n"
                     "/reset - Clear signals\n"
+                    "/test - Send test signal\n"
                     "/broadcast - Send to WS clients\n"
                     "/help - This message",
                     parse_mode='html'
@@ -903,12 +1167,7 @@ class CryptoSignalScraper:
             logger.error(f"Admin command error: {e}")
             await event.respond(f"❌ Error: {str(e)[:100]}", parse_mode=None)
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Channel Discovery & Backfill
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def discover_channels(self):
-        """Discover and cache channel names."""
         logger.info("🔍 Discovering channels...")
         
         try:
@@ -922,14 +1181,13 @@ class CryptoSignalScraper:
                     all_channels = set(self.config.CHANNEL_IDS) | set(self.config.VIP_CHANNEL_IDS)
                     if chat_id in all_channels:
                         vip = " ⭐" if chat_id in self.config.VIP_CHANNEL_IDS else ""
-                        logger.info(f"  📡 {chat_name}{vip}")
+                        logger.info(f"  📡 {chat_name}{vip} (ID: {chat_id})")
             
             logger.info(f"✅ Cached {len(self.channel_cache)} channels")
         except Exception as e:
             logger.error(f"Channel discovery error: {e}")
     
     async def backfill_signals(self):
-        """Backfill recent messages."""
         if not self.config.BACKFILL_ENABLED:
             logger.info("⏭️ Backfill disabled")
             return
@@ -980,12 +1238,7 @@ class CryptoSignalScraper:
         
         logger.info(f"✅ Backfill complete: {total} signals")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Telegram Setup
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def setup_telegram(self) -> bool:
-        """Initialize Telegram client."""
         logger.info("📱 Connecting to Telegram...")
         
         if not self.config.SESSION_STRING:
@@ -1028,12 +1281,15 @@ class CryptoSignalScraper:
                     events.MessageDeleted(chats=all_channels)
                 )
                 logger.info(f"✅ Monitoring {len(all_channels)} channels")
+            else:
+                logger.warning("⚠️ No channels configured to monitor!")
             
             if self.config.ADMIN_IDS:
                 self.telegram_client.add_event_handler(
                     self.handle_admin_command,
                     events.NewMessage(pattern=r'^/', from_users=self.config.ADMIN_IDS)
                 )
+                logger.info(f"✅ Admin commands enabled for {len(self.config.ADMIN_IDS)} users")
             
             await self.backfill_signals()
             return True
@@ -1041,10 +1297,6 @@ class CryptoSignalScraper:
         except Exception as e:
             logger.error(f"❌ Telegram setup error: {e}")
             return False
-    
-    # ─────────────────────────────────────────────────────────────────────────
-    # Shutdown
-    # ─────────────────────────────────────────────────────────────────────────
     
     def handle_shutdown_signal(self, sig):
         logger.info(f"🛑 Received {signal.Signals(sig).name}, shutting down...")
@@ -1073,21 +1325,15 @@ class CryptoSignalScraper:
         
         logger.info("👋 Shutdown complete")
     
-    # ─────────────────────────────────────────────────────────────────────────
-    # Main Entry
-    # ─────────────────────────────────────────────────────────────────────────
-    
     async def run(self):
-        """Main entry point."""
         logger.info("=" * 60)
-        logger.info("  🚀 Crypto Signal Scraper")
+        logger.info("  🚀 Crypto Signal Scraper - Enhanced Parser")
         logger.info("=" * 60)
         
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda s=sig: self.handle_shutdown_signal(s))
         
-        # Start WebSocket server FIRST
         logger.info(f"🌐 Starting WebSocket on port {self.config.WS_PORT}...")
         
         try:
@@ -1107,7 +1353,6 @@ class CryptoSignalScraper:
             logger.error(f"❌ WebSocket failed: {e}")
             return
         
-        # Start background tasks
         asyncio.create_task(self.db.connect())
         
         async def delayed_telegram():
@@ -1119,10 +1364,9 @@ class CryptoSignalScraper:
         self._running = True
         
         logger.info("=" * 60)
-        logger.info("  ✅ Server Ready - WebSocket accepting connections")
+        logger.info("  ✅ Server Ready - Monitoring for signals")
         logger.info("=" * 60)
         
-        # Main loop
         heartbeat_interval = 45
         last_heartbeat = time.time()
         
@@ -1145,7 +1389,8 @@ class CryptoSignalScraper:
                         f"WS: {len(self.broadcaster.clients)} | "
                         f"DB: {'✅' if self.db.is_connected else '❌'} | "
                         f"TG: {'✅' if self.telegram_client and self.telegram_client.is_connected() else '❌'} | "
-                        f"Signals: {stats.get('active', 0)}"
+                        f"Processed: {self._signals_processed} | "
+                        f"Parsed: {self._signals_parsed}"
                     )
                     last_heartbeat = now
                     
